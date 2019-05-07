@@ -2,7 +2,6 @@
 from __future__ import absolute_import, division, print_function
 
 import os
-import gc
 import csv
 import sys
 import glob
@@ -14,16 +13,17 @@ import subprocess
 import tables
 import codecs
 import numpy as np
-import soundfile as sf
 import scipy.io.wavfile as wav
 
 from python_speech_features import mfcc
 from threading import Lock
-from random import shuffle
+from random import shuffle, randrange, uniform
+from random import choices
 from shutil import copyfile
 from pydub import AudioSegment
 from intervaltree import IntervalTree
 from multiprocessing import cpu_count
+
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
 
@@ -121,7 +121,6 @@ class CommandLineParser(object):
                 options[opt_name] = opt_value
             state.prev()
             result = cmd.action(*arg_values, **options)
-            gc.collect()
             if result:
                 return result
         return None
@@ -190,14 +189,9 @@ class WavFile(object):
         self._filesize = filesize
         self._duration = duration
         self._stats = None
-        # if self.file_is_tmp:
-        #    log('New tmp file %s.' % self.filename)
-        # else:
-        #    log('New file %s.' % self.filename)
 
     def __del__(self):
         if self.file_is_tmp and os.path.exists(self.filename):
-            # log('Deleting tmp file %s.' % self.filename)
             os.remove(self.filename)
 
     def save_as(self, filename):
@@ -217,12 +211,18 @@ class WavFile(object):
     @property
     def stats(self):
         if not self._stats:
-            self._stats = sf.info(self.filename)
+            entries = subprocess.check_output(['soxi', self.filename], stderr=subprocess.STDOUT).decode()
+            entries = entries.strip().split('\n')
+            entries = [e.split(':')[:2] for e in entries]
+            entries = [(e[0].strip(), e[1].strip()) for e in entries if len(e) == 2]
+            self._stats = { key: value for (key, value) in entries }
         return self._stats
 
     @property
     def duration(self):
-        return self.stats.duration
+        if self._duration < 0:
+            self._duration = float(subprocess.check_output(['soxi', '-D', self.filename]).strip())
+        return self._duration
 
     @property
     def filesize(self):
@@ -230,11 +230,9 @@ class WavFile(object):
             self._filesize = os.path.getsize(self.filename)
         return self._filesize
 
-class RateEffect(object):
-    def __init__(self, rate):
-        self.rate = rate
-    def apply(self, seg):
-        return seg.set_frame_rate(self.rate)
+    @property
+    def volume(self):
+        return float(self.stats['Volume adjustment'])
 
 class Sample(object):
     def __init__(self, file, transcript=None, tags=[]):
@@ -242,31 +240,52 @@ class Sample(object):
         self.transcript = transcript
         self.tags = tags
         self.original_name = self.file.filename
-        self.effects = []
+        self.effects = ''
 
     def write(self, filename=None):
         if len(self.effects) > 0:
-            effects = self.effects
-            self.effects = []
-            seg = self.read_audio_segment()
-            for effect in effects:
-                seg = effect.apply(seg)
-            self.write_audio_segment(seg, filename=filename)
+            file = WavFile(filename=filename)
+            subprocess.check_output(['sox', self.file.filename, file.filename] + self.effects.strip().split(' '))
+            self.effects = ''
+            self.file = file
         elif filename:
             self.file = self.file.save_as(filename)
+
+    def pipe(self, commands):
+        self.write()
+        file = WavFile()
+        def subst(item):
+            if item == 'IN':
+                return self.file.filename
+            elif item == 'OUT':
+                return file.filename
+            else:
+                return item
+        first = None
+        last = None
+        for i, command in enumerate(commands):
+            command = [subst(item) for item in command]
+            last = subprocess.Popen(command, stdin=last.stdout if last else None, stdout=subprocess.PIPE if first is None else None)
+            if first is None:
+                first = last
+        first.wait()
+        self.file = file
+
+    def add_sox_effect(self, effect):
+        self.effects += ' %s' % effect
 
     def read_audio_segment(self):
         self.write()
         return AudioSegment.from_file(self.file.filename, format="wav")
 
-    def write_audio_segment(self, segment, filename=None):
-        self.file = WavFile(filename=filename)
+    def write_audio_segment(self, segment):
+        self.file = WavFile()
         segment.export(self.file.filename, format="wav")
 
     def clone(self):
         sample = Sample(self.file, transcript=self.transcript, tags=self.tags)
         sample.original_name = self.original_name
-        sample.effects = self.effects[:]
+        sample.effects = self.effects
         return sample
 
     def __str__(self):
@@ -337,7 +356,6 @@ class DataSetBuilder(CommandLineParser):
 
         cmd = self.add_command('write', self._write, 'Write samples of current buffer to disk')
         cmd.add_argument('dir_name', 'string', 'Path to the new sample directory. The directory and a file with the same name plus extension ".csv" should not exist.')
-        cmd.add_option('just_csv', 'bool', 'Prevents writing samples')
 
         cmd = self.add_command('hdf5', self._hdf5, 'Write samples to hdf5 MFCC feature DB that can be used by DeepSpeech')
         cmd.add_argument('alphabet_path', 'string', 'Path to DeepSpeech alphabet file to use for transcript mapping')
@@ -347,23 +365,52 @@ class DataSetBuilder(CommandLineParser):
 
         self.add_group('Effects')
 
-        cmd = self.add_command('compr', self._compr, 'Distortion by mp3 compression')
+        cmd = self.add_command('reverb', self._reverb, 'Adds reverberation to buffer samples')
+        cmd.add_option('wet_only', 'bool', 'If to strip source signal on output')
+        cmd.add_option('reverberance', 'float', 'Reverberance factor (between 0.0 to 1.0)')
+        cmd.add_option('hf_damping', 'float', 'HF damping factor (between 0.0 to 1.0)')
+        cmd.add_option('room_scale', 'float', 'Room scale factor (between 0.0 to 1.0)')
+        cmd.add_option('stereo_depth', 'float', 'Stereo depth factor (between 0.0 to 1.0)')
+        cmd.add_option('pre_delay', 'int', 'Pre delay in ms')
+        cmd.add_option('wet_gain', 'float', 'Wet gain in dB')
+
+        cmd = self.add_command('echo', self._echo, 'Adds an echo effect to buffer samples')
+        cmd.add_argument('gain_in', 'float', 'Gain in')
+        cmd.add_argument('gain_out', 'float', 'Gain out')
+        cmd.add_argument('delay_decay', 'string', 'Comma separated delay decay pairs - at least one (e.g. 10,0.1,20,0.2)')
+
+        cmd = self.add_command('speed', self._speed, 'Adds an speed effect to buffer samples')
+        cmd.add_argument('factor', 'float', 'Speed factor to apply')
+
+        cmd = self.add_command('pitch', self._pitch, 'Adds a pitch effect to buffer samples')
+        cmd.add_argument('cents', 'int', 'Cents (100th of a semi-tome) of shift to apply')
+
+        cmd = self.add_command('tempo', self._tempo, 'Adds a tempo effect to buffer samples')
+        cmd.add_argument('factor', 'float', 'Tempo factor to apply')
+
+        cmd = self.add_command('distcompression', self._dist_compression, 'Distortion by mp3 compression')
         cmd.add_argument('kbit', 'int', 'Virtual bandwidth in kBit/s')
 
-        cmd = self.add_command('rate', self._rate, 'Resampling to different sample rate')
+        cmd = self.add_command('distrate', self._dist_rate, 'Distortion by resampling')
         cmd.add_argument('rate', 'int', 'Sample rate to apply')
+
+        cmd = self.add_command('sox', self._sox, 'Adds a SoX effect to buffer samples')
+        cmd.add_argument('effect', 'string', 'SoX effect name')
+        cmd.add_argument('args', 'string', 'Comma separated list of SoX effect parameters (no white space allowed)')
 
         cmd = self.add_command('augment', self._augment, 'Augment samples of current buffer with noise')
         cmd.add_argument('source', 'string', 'CSV file with samples to augment onto current sample buffer')
         cmd.add_option('times', 'int', 'How often to apply the augmentation source to the sample buffer')
         cmd.add_option('gain', 'float', 'How much gain (in dB) to apply to augmentation audio before overlaying onto buffer samples')
 
+        cmd = self.add_command('augment_combination', self._augment_combination, 'Augment samples of current buffer with random combination of noise samples')
+        cmd.add_argument('source', 'string', 'CSV file with samples to augment onto current sample buffer')
+        cmd.add_option('combination_count', 'int', 'How many noise samples are mixed before overlayed onto buffer samples')
+        cmd.add_option('gain', 'float',
+                       'How much gain (in dB) to apply to augmentation audio before overlaying onto buffer samples')
+
         self.named_buffers = {}
         self.samples = []
-
-    def _progress(self, message, lst, total=-1):
-        log(message)
-        return tqdm.tqdm(lst, ascii=True, ncols=100, mininterval=60.0, total=len(lst) if total < 0 else total)
 
     def _map(self, message, lst, fun, use_processes=False, map_fun=lambda x: x, worker_count=0, total=-1):
         worker_count = cpu_count() if worker_count < 1 else worker_count
@@ -374,6 +421,10 @@ class DataSetBuilder(CommandLineParser):
         pool.close()
         pool.join()
         return results
+
+    def _progress(self, message, lst, total=-1):
+        log(message)
+        return tqdm.tqdm(lst, ascii=True, ncols=100, mininterval=60.0, total=len(lst) if total < 0 else total)
 
     def _clone_buffer(self, buffer):
         samples = []
@@ -517,33 +568,25 @@ class DataSetBuilder(CommandLineParser):
             sys.stdout.write(seg.set_sample_width(2).set_frame_rate(88200).raw_data)
         log('Piped %d samples.' % len(self.samples))
 
-    def _write(self, dir_name, just_csv=False):
+    def _write(self, dir_name):
         parent, name = os.path.split(os.path.normpath(dir_name))
         csv_filename = os.path.join(parent, name + '.csv')
         if os.path.exists(dir_name) or os.path.exists(csv_filename):
             return 'Cannot write buffer, as either "%s" or "%s" already exist.' % (dir_name, csv_filename)
-        if not just_csv:
-            os.makedirs(dir_name)
+        os.makedirs(dir_name)
         samples = [(i, sample) for i, sample in enumerate(self.samples)]
         with open(csv_filename, 'w') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['wav_filename', 'wav_filesize', 'transcript', 'tags', 'duration'])
             def write_sample(i_sample):
                 i, sample = i_sample
-                if just_csv:
-                    writer.writerow([sample.file.filename,
-                                     sample.file.filesize,
-                                     sample.transcript,
-                                     ' '.join(sample.tags),
-                                     sample.file.duration])
-                else:
-                    samplename = 'sample-%d.wav' % i
-                    sample.write(filename=os.path.join(dir_name, samplename))
-                    writer.writerow([os.path.join(name, samplename),
-                                     sample.file.filesize,
-                                     sample.transcript,
-                                     ' '.join(sample.tags),
-                                     sample.file.duration])
+                sample_name = os.path.basename(sample.original_name) #'sample-%d.wav' % i
+                sample.write(filename=os.path.join(dir_name, sample_name))
+                writer.writerow([os.path.join(name, sample_name),
+                                 sample.file.filesize,
+                                 sample.transcript,
+                                 ' '.join(sample.tags),
+                                 sample.file.duration])
             self._map('Writing samples...', samples, write_sample)
         log('Wrote %d samples to directory "%s" and listed them in CSV file "%s".' % (len(self.samples), dir_name, csv_filename))
 
@@ -561,19 +604,12 @@ class DataSetBuilder(CommandLineParser):
                 alphabet_size += 1
 
         def process_sample(sample):
-            if len(sample.transcript) == 0:
-                skipped.append(sample.original_name)
-                return None
             sample.write()
-            try:
-                samplerate, audio = wav.read(sample.file.filename)
-                transcript = np.asarray([str_to_label[c] for c in sample.transcript])
-            except:
-                skipped.append(sample.original_name)
-                return None
+            samplerate, audio = wav.read(sample.file.filename)
             features = mfcc(audio, samplerate=samplerate, numcep=ninput)[::2]
             empty_context = np.zeros((ncontext, ninput), dtype=features.dtype)
             features = np.concatenate((empty_context, features, empty_context))
+            transcript = np.asarray([str_to_label[c] for c in sample.transcript])
             if (2*ncontext + len(features)) < len(transcript):
                 skipped.append(sample.original_name)
                 return None
@@ -582,7 +618,7 @@ class DataSetBuilder(CommandLineParser):
         out_data = self._map('Computing MFCC features...', self.samples, process_sample)
         out_data = [s for s in out_data if s is not None]
         if len(skipped) > 0:
-            log('WARNING - Skipped %d samples that had no transcription, had been too short for their transcription or had been missed:' % len(skipped))
+            log('WARNING - Skipped %d samples that had been too short for their transcription:' % len(skipped))
             for s in skipped:
                 log(' - Sample origin: "%s".' % s)
         if len(out_data) <= 0:
@@ -606,21 +642,62 @@ class DataSetBuilder(CommandLineParser):
             transcript_len_dset = file.create_array(file.root, 'transcript_len', transcript_len)
         log('Wrote features of %d samples to feature DB "%s".' % (len(features), hdf5_path))
 
-    def _rate(self, rate):
-        effect = RateEffect(rate)
+    def _reverb(self, wet_only=False, reverberance=0.5, hf_damping=0.5, room_scale=1.0, stereo_depth=1.0, pre_delay=0, wet_gain=0):
+        effect = 'reverb %s%d %d %d %d %d %d' % \
+            ('-w ' if wet_only else '', int(reverberance*100.0), int(hf_damping*100.0), int(room_scale*100.0), int(stereo_depth*100.0), pre_delay, wet_gain)
         for s in self.samples:
-            s.effects.append(effect)
-        log('Applied rate change to %d samples in buffer.' % len(self.samples))
+            s.add_sox_effect(effect)
+        log('Added reverberation to %d samples in buffer.' % len(self.samples))
 
-    def _compr(self, kbit):
-        def add_compr(s):
-            with tempfile.TemporaryFile() as f:
-                seg = s.read_audio_segment()
-                seg.export(f, format='mp3', bitrate='%dk' % kbit)
-                f.seek(0, 0)
-                s.write_audio_segment(AudioSegment.from_file(f, format='mp3'))
-        self._map('Adding compression artifacts...', self.samples, add_compr, worker_count=1)
-        log('Applied compression artifacts to %d samples in buffer.' % len(self.samples))
+    def _echo(self, gain_in, gain_out, delay_decay):
+        delay_decay = delay_decay.split(',')
+        assert len(delay_decay) % 2 == 0
+        assert len(delay_decay) > 1
+        effect = 'echo %f %f %s' % (gain_in, gain_out, ' '.join(delay_decay))
+        for s in self.samples:
+            s.add_sox_effect(effect)
+        log('Added echo effect to %d samples in buffer.' % len(self.samples))
+
+    def _speed(self, factor):
+        effect = 'speed %f' % factor
+        for s in self.samples:
+            s.add_sox_effect(effect)
+        log('Added speed effect to %d samples in buffer.' % len(self.samples))
+
+    def _pitch(self, cents):
+        for s in self.samples:
+            random_cents = randrange(-1 * cents, cents)
+            print('pitch {} chosen from interval {} and {} for sample {}'.format(random_cents, -1 * cents, cents, s.original_name))
+            effect = 'pitch %d' % random_cents
+            s.add_sox_effect(effect)
+        log('Added pitch effect to %d samples in buffer.' % len(self.samples))
+
+    def _tempo(self, factor):
+        for s in self.samples:
+            random_factor = uniform(2.0 - factor, factor)
+            print('tempo {} chosen from interval {} and {}'.format(random_factor, 2.0 - factor, factor))
+            effect = 'tempo -s %f' % random_factor
+            s.add_sox_effect(effect)
+        log('Added tempo effect to %d samples in buffer.' % len(self.samples))
+
+    def _dist_compression(self, kbit):
+        self._map('Distorting samples...',
+                  self.samples,
+                  lambda s: s.pipe([['sox', 'IN', '-t', 'mp3', '-C', str(kbit), '-'],
+                                    ['sox', '-t', 'mp3', '-', 'OUT']]))
+        log('Distorted %d samples in buffer by mp3 compression.' % len(self.samples))
+
+    def _dist_rate(self, rate):
+        self._map('Distorting samples...',
+                  self.samples,
+                  lambda s: s.add_sox_effect('rate %d rate %d' % (rate, int(s.file.stats['Sample Rate']))))
+        log('Distorted %d samples in buffer by resampling to different sample rate.' % len(self.samples))
+
+    def _sox(self, effect, args):
+        effect = '%s %s' % (effect, ' '.join(args.split(',')))
+        for s in self.samples:
+            s.add_sox_effect(effect)
+        log('Added %s effect to %d samples in buffer.' % (effect, len(self.samples)))
 
     def _augment(self, source, times=1, gain=-8):
         aug_samples = self._load_samples(source)
@@ -675,6 +752,55 @@ class DataSetBuilder(CommandLineParser):
                   map_fun=exchange_file)
         log('Augmented %d samples in buffer.' % len(self.samples))
 
+    def _augment_combination(self, source, combination_count=10, gain=-8):
+        aug_samples = self._load_samples(source)
+
+        augmentations = []
+        for i, sample in self._progress('Computing intervals...',
+                                        enumerate(self.samples),
+                                        total=len(self.samples)):
+            overlays = []
+            chosen_aug_samples = choices(aug_samples, k=combination_count)
+            for chosen_aug_sample in chosen_aug_samples:
+                overlays.append(chosen_aug_sample.file.filename)
+
+            augmentations.append((i, sample.file.filename, get_tmp_filename(), overlays, gain))
+
+        def exchange_file(index_filename):
+            index, filename = index_filename
+            sample = self.samples[index]
+            orig_file = sample.file
+            sample.file = WavFile(filename,
+                                  filesize=orig_file.filesize,
+                                  duration=orig_file.duration,
+                                  enforce_tmp=True)
+
+        self._map('Augmenting samples...',
+                  augmentations,
+                  augment_sample_combination,
+                  use_processes=True,
+                  map_fun=exchange_file)
+        log('Augmented %d samples in buffer.' % len(self.samples))
+
+
+def augment_sample_combination(augmentation):
+    index, src_file, dst_file, overlays, gain = augmentation
+    orig_seg = AudioSegment.from_file(src_file, format="wav")
+    aug_seg = AudioSegment.silent(duration=len(orig_seg))
+    position=0
+    for overlay in overlays:
+        overlay_file = overlay
+        overlay_seg = AudioSegment.from_file(overlay_file, format="wav")
+        aug_seg = aug_seg.overlay(overlay_seg, position=position)
+        if(position + len(overlay_seg)) > len(aug_seg):
+            aug_seg = aug_seg.overlay(overlay_seg[len(aug_seg)-position:], position=0)
+        position = (position + len(overlay_seg)) % len(aug_seg)
+    aug_seg = aug_seg + (orig_seg.dBFS - aug_seg.dBFS + gain)
+    orig_seg = orig_seg.overlay(aug_seg)
+    orig_seg.export(dst_file, format="wav")
+    return index, dst_file
+
+
 def augment_sample(augmentation):
     index, src_file, dst_file, overlays, gain = augmentation
     orig_seg = AudioSegment.from_file(src_file, format="wav")
@@ -691,6 +817,7 @@ def augment_sample(augmentation):
     orig_seg.export(dst_file, format="wav")
     return (index, dst_file)
 
+
 def main():
     parser = DataSetBuilder()
     parser.parse(sys.argv[1:])
@@ -701,6 +828,4 @@ if __name__ == '__main__' :
     except KeyboardInterrupt:
         log('Interrupted by user')
     if tmp_dir:
-        log('Removing tmp files')
         shutil.rmtree(tmp_dir)
-
